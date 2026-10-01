@@ -37,7 +37,22 @@ jobs:
           curl -fsSL "$PASSPORT_CLI_URL" -o passport.py
           python3 passport.py stages >> "$GITHUB_ENV"
 
+      # Does this repository produce an image at all? A repository holding only infrastructure
+      # code, or one whose image is built elsewhere, has nothing to build here.
+      - name: Is there an image to build
+        id: img
+        run: |
+          if [ -n "${PASSPORT_IMAGE:-}" ]; then
+            echo "build=false" >> "$GITHUB_OUTPUT"      # the dashboard names the image to judge
+          elif [ -f Dockerfile ] || [ -f dockerfile ] || [ -f docker/Dockerfile ]; then
+            echo "build=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "build=false" >> "$GITHUB_OUTPUT"      # nothing to build: checks still run
+            echo "::notice::No Dockerfile found and no image named in Release Passport, so no image is built or scanned."
+          fi
+
       - uses: docker/login-action@v3
+        if: steps.img.outputs.build == 'true'
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
@@ -45,6 +60,7 @@ jobs:
 
       - name: Build and push
         id: build
+        if: steps.img.outputs.build == 'true'
         uses: docker/build-push-action@v6
         with:
           context: .
@@ -52,14 +68,22 @@ jobs:
           provenance: false
           tags: ${{ env.IMAGE }}:${{ github.sha }}
 
-      - name: Image reference by digest
+      # The reference being judged: the image named in the dashboard, or the one just built.
+      - name: Image reference
         id: ref
-        run: echo "image=$IMAGE@${{ steps.build.outputs.digest }}" >> "$GITHUB_OUTPUT"
+        run: |
+          if [ -n "${PASSPORT_IMAGE:-}" ]; then
+            echo "image=$PASSPORT_IMAGE" >> "$GITHUB_OUTPUT"
+          elif [ "${{ steps.img.outputs.build }}" = "true" ]; then
+            echo "image=$IMAGE@${{ steps.build.outputs.digest }}" >> "$GITHUB_OUTPUT"
+          else
+            echo "image=" >> "$GITHUB_OUTPUT"
+          fi
 
       # Skipped when Image security is switched off in the dashboard. Without this scan the
       # passport rests on the pipeline identity and the digest alone, which the run records.
       - name: Image security (Trivy, operating-system packages)
-        if: env.PASSPORT_STAGE_IMAGE == '1'
+        if: env.PASSPORT_STAGE_IMAGE == '1' && steps.ref.outputs.image != ''
         env:
           TRIVY_USERNAME: ${{ github.actor }}
           TRIVY_PASSWORD: ${{ secrets.GITHUB_TOKEN }}
@@ -70,7 +94,7 @@ jobs:
             --format json --output trivy.json "${{ steps.ref.outputs.image }}"
 
       - name: Dependencies (Trivy, application libraries)
-        if: env.PASSPORT_STAGE_SCA == '1'
+        if: env.PASSPORT_STAGE_SCA == '1' && steps.ref.outputs.image != ''
         continue-on-error: true   # a broken scanner is reported on the run, not hidden here
         env:
           TRIVY_USERNAME: ${{ github.actor }}
@@ -109,9 +133,13 @@ jobs:
           docker run --rm --user "$(id -u):$(id -g)" -v "$PWD:/tf" -w /tf \
             bridgecrew/checkov:3.2.334 -d . --output json --quiet --compact > checkov.json || true
 
+      # With no image, --image is left out and the commit is what gets judged.
       - name: Request release passport
         run: |
-          python3 passport.py permit --image "${{ steps.ref.outputs.image }}" --report trivy.json \
+          IMAGE_ARG=""
+          [ -n "${{ steps.ref.outputs.image }}" ] && IMAGE_ARG='--image ${{ steps.ref.outputs.image }}'
+          # shellcheck disable=SC2086
+          python3 passport.py permit $IMAGE_ARG --report trivy.json \
             --stage-report sca=trivy-sca.json \
             --stage-report secrets=gitleaks.json --stage-report sast=semgrep.json \
             --stage-report iac=checkov.json
