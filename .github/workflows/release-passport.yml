@@ -93,8 +93,10 @@ jobs:
             --cache-dir /work/.trivycache --scanners vuln --pkg-types os \
             --format json --output trivy.json "${{ steps.ref.outputs.image }}"
 
+      # Dependencies: Trivy by default. Choose OWASP Dependency-Check in the dashboard and run
+      # the step below instead; any other scanner can send SARIF (--stage-report sca=report.sarif).
       - name: Dependencies (Trivy, application libraries)
-        if: env.PASSPORT_STAGE_SCA == '1' && steps.ref.outputs.image != ''
+        if: env.PASSPORT_STAGE_SCA == '1' && env.PASSPORT_SCANNER_SCA == 'trivy' && steps.ref.outputs.image != ''
         continue-on-error: true   # a broken scanner is reported on the run, not hidden here
         env:
           TRIVY_USERNAME: ${{ github.actor }}
@@ -126,6 +128,22 @@ jobs:
             -e HOME=/sghome -e SEMGREP_SETTINGS_FILE=/sghome/settings.yml \
             semgrep/semgrep:1.97.0 semgrep scan --config p/default --json --output semgrep.json --quiet --metrics=off
 
+      - name: Dependencies (OWASP Dependency-Check)
+        if: env.PASSPORT_STAGE_SCA == '1' && env.PASSPORT_SCANNER_SCA == 'dependency-check'
+        continue-on-error: true   # a broken scanner is reported on the run, not hidden here
+        run: |
+          mkdir -p dc-report dc-data
+          # NVD_API_KEY is optional but makes the first run far quicker
+          docker run --rm --user "$(id -u):$(id -g)" \
+            -v "$PWD:/src" -v "$PWD/dc-data:/usr/share/dependency-check/data" \
+            -v "$PWD/dc-report:/report" \
+            owasp/dependency-check:10.0.4 \
+            --scan /src --format JSON --out /report --project "${{ github.repository }}" \
+            ${NVD_API_KEY:+--nvdApiKey "$NVD_API_KEY"} || true
+          cp dc-report/dependency-check-report.json depcheck.json 2>/dev/null || true
+        env:
+          NVD_API_KEY: ${{ secrets.NVD_API_KEY }}
+
       - name: Infrastructure as code (Checkov)
         if: env.PASSPORT_STAGE_IAC == '1'
         continue-on-error: true   # a broken scanner is reported on the run, not hidden here
@@ -140,7 +158,7 @@ jobs:
           [ -n "${{ steps.ref.outputs.image }}" ] && IMAGE_ARG='--image ${{ steps.ref.outputs.image }}'
           # shellcheck disable=SC2086
           python3 passport.py permit $IMAGE_ARG --report trivy.json \
-            --stage-report sca=trivy-sca.json \
+            --stage-report sca=trivy-sca.json --stage-report sca=depcheck.json \
             --stage-report secrets=gitleaks.json --stage-report sast=semgrep.json \
             --stage-report iac=checkov.json
 
