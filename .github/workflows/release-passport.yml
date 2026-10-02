@@ -107,8 +107,15 @@ jobs:
             --cache-dir /work/.trivycache --scanners vuln --pkg-types library \
             --format json --output trivy-sca.json "${{ steps.ref.outputs.image }}"
 
+      - name: Image security (Anchore Grype)
+        if: env.PASSPORT_STAGE_IMAGE == '1' && env.PASSPORT_SCANNER_IMAGE == 'grype' && steps.ref.outputs.image != ''
+        continue-on-error: true
+        run: |
+          docker run --rm -v /var/run/docker.sock:/var/run/docker.sock \
+            anchore/grype:latest "${{ steps.ref.outputs.image }}" -o sarif > trivy.json || true
+
       - name: Secret detection (Gitleaks)
-        if: env.PASSPORT_STAGE_SECRETS == '1'
+        if: env.PASSPORT_STAGE_SECRETS == '1' && env.PASSPORT_SCANNER_SECRETS == 'gitleaks'
         continue-on-error: true   # a broken scanner is reported on the run, not hidden here
         run: |
           # 'dir' scans the files as they are now. 'detect' would only look at commit history,
@@ -118,8 +125,32 @@ jobs:
             zricethezav/gitleaks:v8.21.2 dir . -c gitleaks.toml \
             --report-format json --report-path gitleaks.json --no-banner --exit-code 0
 
+      - name: Secret detection (TruffleHog)
+        if: env.PASSPORT_STAGE_SECRETS == '1' && env.PASSPORT_SCANNER_SECRETS == 'trufflehog'
+        continue-on-error: true
+        run: |
+          docker run --rm -v "$PWD:/repo" ghcr.io/trufflesecurity/trufflehog:latest \
+            filesystem /repo --json > th.jsonl || true
+          python3 - <<'PY' > gitleaks.json
+          import json, sys
+          runs = [{"tool": {"driver": {"name": "TruffleHog"}}, "results": []}]
+          for line in open("th.jsonl"):
+              try:
+                  d = json.loads(line)
+              except ValueError:
+                  continue
+              meta = (d.get("SourceMetadata") or {}).get("Data", {}).get("Filesystem", {})
+              runs[0]["results"].append({
+                  "ruleId": d.get("DetectorName", "secret"), "level": "error",
+                  "message": {"text": f"{d.get('DetectorName', 'secret')} found"},
+                  "locations": [{"physicalLocation": {
+                      "artifactLocation": {"uri": meta.get("file", "")},
+                      "region": {"startLine": int(meta.get("line") or 1)}}}]})
+          json.dump({"version": "2.1.0", "runs": runs}, sys.stdout)
+          PY
+
       - name: Code analysis (Semgrep)
-        if: env.PASSPORT_STAGE_SAST == '1'
+        if: env.PASSPORT_STAGE_SAST == '1' && env.PASSPORT_SCANNER_SAST == 'semgrep'
         continue-on-error: true
         run: |
           mkdir -p "$RUNNER_TEMP/semgrep-home"
@@ -144,14 +175,65 @@ jobs:
         env:
           NVD_API_KEY: ${{ secrets.NVD_API_KEY }}
 
+      - name: Code analysis (Snyk Code)
+        if: env.PASSPORT_STAGE_SAST == '1' && env.PASSPORT_SCANNER_SAST == 'snyk'
+        continue-on-error: true
+        env:
+          SNYK_TOKEN: ${{ secrets[env.PASSPORT_SAST_TOKEN_SECRET || 'SNYK_TOKEN'] }}
+        run: |
+          npx --yes snyk@latest code test --sarif-file-output=semgrep.json || true
+
+      - name: Code analysis (SonarQube export)
+        if: env.PASSPORT_STAGE_SAST == '1' && env.PASSPORT_SCANNER_SAST == 'sonarqube'
+        continue-on-error: true
+        env:
+          SONAR_TOKEN: ${{ secrets[env.PASSPORT_SAST_TOKEN_SECRET || 'SONAR_TOKEN'] }}
+        run: |
+          # SonarQube keeps issues on its server, so export them as SARIF for this run
+          curl -fsSL -u "$SONAR_TOKEN:" \
+            "$PASSPORT_SAST_SERVER/api/issues/search?componentKeys=$PASSPORT_SAST_PROJECT_KEY&resolved=false&ps=500" \
+            -o sonar-issues.json || true
+          python3 - <<'PY' > semgrep.json
+          import json, sys
+          try:
+              issues = json.load(open("sonar-issues.json")).get("issues", [])
+          except Exception:
+              issues = []
+          level = {"BLOCKER": "error", "CRITICAL": "error", "MAJOR": "warning",
+                   "MINOR": "note", "INFO": "note"}
+          json.dump({"version": "2.1.0", "runs": [{"tool": {"driver": {"name": "SonarQube"}},
+              "results": [{"ruleId": i.get("rule", "sonar"),
+                           "level": level.get(i.get("severity", ""), "warning"),
+                           "message": {"text": i.get("message", "")},
+                           "locations": [{"physicalLocation": {
+                               "artifactLocation": {"uri": (i.get("component") or "").split(":")[-1]},
+                               "region": {"startLine": (i.get("textRange") or {}).get("startLine", 1)}}}]}
+                          for i in issues]}]}, sys.stdout)
+          PY
+
       - name: Infrastructure as code (Checkov)
-        if: env.PASSPORT_STAGE_IAC == '1'
+        if: env.PASSPORT_STAGE_IAC == '1' && env.PASSPORT_SCANNER_IAC == 'checkov'
         continue-on-error: true   # a broken scanner is reported on the run, not hidden here
         run: |
           docker run --rm --user "$(id -u):$(id -g)" -v "$PWD:/tf" -w /tf \
             bridgecrew/checkov:3.2.334 -d . --output json --quiet --compact > checkov.json || true
 
       # With no image, --image is left out and the commit is what gets judged.
+      - name: Infrastructure as code (Trivy config scan)
+        if: env.PASSPORT_STAGE_IAC == '1' && env.PASSPORT_SCANNER_IAC == 'trivy'
+        continue-on-error: true
+        run: |
+          docker run --rm --user "$(id -u):$(id -g)" -v "$PWD:/work" -w /work "$TRIVY_IMAGE" \
+            config . --format sarif --output checkov.json || true
+
+      - name: Infrastructure as code (Snyk IaC)
+        if: env.PASSPORT_STAGE_IAC == '1' && env.PASSPORT_SCANNER_IAC == 'snyk'
+        continue-on-error: true
+        env:
+          SNYK_TOKEN: ${{ secrets[env.PASSPORT_IAC_TOKEN_SECRET || 'SNYK_TOKEN'] }}
+        run: |
+          npx --yes snyk@latest iac test --sarif-file-output=checkov.json . || true
+
       - name: Request release passport
         run: |
           IMAGE_ARG=""
